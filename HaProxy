@@ -1,0 +1,99 @@
+Avoiding Deadlocks in Galera - Set up HAProxy for single-node writes and multi-node reads
+
+Galera cluster has known limitations, one of them is that it uses cluster-wide optimistic locking. This may cause some transactions to rollback. With an increasing number of writeable masters, the transaction rollback rate may increase, especially if there is write contention on the same dataset. It is of course possible to retry the transaction and perhaps it will COMMIT in the retries, but this will add to the transaction latency. However, some designs are deadlock prone, e.g sequence tables. In this blog we present how you can minimize the risk for deadlocks due to the design of Galera. 
+Test Case
+Here is a simple test case. We have a table that contains a column and a row that hold a number and is regularly updated to provide a sequential number. Here is the table structure:
+mysql> CREATE TABLE `seq_num` (
+  `number` bigint(20) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=latin1
+We have a simple shell script called sequential_update.sh used to update the number sequentianally. In this test, we are using the default REPEATABLE-READ isolation level. Now let’s run it with 10000 updates on one of the database node in Galera cluster (single-node read/write):
+$ ./sequential_update.sh 10000 single.log
+Output of the last 5 lines:
+$ tail -5 single.log
+#9996: 9996 -> 9997
+#9997: 9997 -> 9998
+#9998: 9998 -> 9999
+#9999: 9999 -> 10000
+#10000: 10000 -> 10001
+Next, we ran the script by connecting to HAproxy instance which having three-node Galera cluster load balanced with round robin (multi-node read/write):
+$ ./sequential_update.sh 10000 multi.log
+ERROR 1213 (40001) at line 1: Deadlock found when trying to get lock; try restarting transaction
+ERROR 1213 (40001) at line 1: Deadlock found when trying to get lock; try restarting transaction
+ERROR 1213 (40001) at line 1: Deadlock found when trying to get lock; try restarting transaction
+Output of the last 5 lines. Notice that the sequence number (#) does not tally with the updated value. It has missed 3 sequential numbers during the deadlock occurrences:
+$ tail -5 multi.log
+#9996: 9993 -> 9994
+#9997: 9994 -> 9995
+#9998: 9995 -> 9996
+#9999: 9996 -> 9997
+#10000: 9997 -> 9998
+Explanation
+This is expected behaviour in Galera, and is caused by optimistic locking. When coordinating updates from multiple database sessions, optimistic locking is a strategy that assumes all updates can complete without conflict. If two sessions try to modify the same data, the second one to commit will be rejected and has to retry the transaction.
+On the originator node, it can obtain all of the necessary locks for the transaction, but it has no idea about the rest of the cluster. So, it optimistically sends the transaction (aka writeset) out to all the other nodes to see if they will commit.
+￼
+ 
+After that, the writeset undergoes a deterministic certification test on each node (including the writeset originator node) which determines if the writeset can be applied or not. If the certification test fails, the writeset is dropped and the original transaction is rolled back. If the test succeeds, the transaction is committed and the writeset is applied on the rest of the nodes.  
+Workaround - Send conflicting updates to one node only
+If your data has a high concurrency of writes, one workaround is to only send updates (either all updates, or only the updates that create deadlocks) to one node only. 
+When deploying HAProxy via ClusterControl, HAProxy will load balance all requests across the load balancing set. We just need to append the following lines at the end of the HAProxy configuration file located at /etc/haproxy/haproxy.cfg to have a port (33307) that redirects to only one Galera node at a time:
+listen s9s1_33307_LB1
+	bind *:33307
+	mode tcp
+	timeout client 60000ms
+	timeout server 60000ms
+	balance leastconn
+	option httpchk
+	default-server port 9200 inter 2s downinter 5s rise 3 fall 2 slowstart 60s maxconn 256 maxqueue 128 weight 100
+	server 192.168.0.101 192.168.0.101:3306 check
+	server 192.168.0.102 192.168.0.102:3306 check backup
+	server 192.168.0.103 192.168.0.103:3306 check backup
+Then, restart the HAproxy instance by using following command:
+$ sudo killall -9 haproxy
+$ sudo haproxy -f /etc/haproxy/haproxy.cfg -p /var/run/haproxy.pid -st $(cat /var/run/haproxy.pid)
+Or you just kill the process manually and let ClusterControl recover the HAProxy process (you can see what processes are managed by ClusterControl under Manage Process page).
+Verify if HAproxy listening to the correct ports:
+$ netstat -tulpn | grep haproxy
+tcp        0      0 0.0.0.0:33306               0.0.0.0:*                   LISTEN      54408/haproxy
+tcp        0      0 0.0.0.0:33307               0.0.0.0:*                   LISTEN      54408/haproxy
+tcp        0      0 0.0.0.0:9600                0.0.0.0:*                   LISTEN      54408/haproxy
+Now you can configure your applications to talk to both HAproxy instances respectively. Remember to use 33306 for reads as it load-balances to all nodes, and 33307 is strictly for single-node writes. HAproxy will take care of the node failover automatically if the “main master” fails by connecting to the next host in backup list.
+Note: 
+When only one node at a time is supposed to be used as a master, certain requirements may be relaxed. For example slave queue size is not that critical. Thus flow control may be relaxed:
+wsrep_provider_options = "gcs.fc_limit = 256; gcs.fc_factor = 0.99; gcs.fc_master_slave = yes"
+This may improve replication performance somewhat by reducing the rate of flow control events. This setting is safe if suboptimal in multi-master setup as well.
+Appendix
+Source code - sequential_update.sh
+#/bin/bash
+# Example usage: ./sequential_update.sh [count] [output_file]
+ 
+COUNT=$1
+OUTPUT_FILE=$2
+ 
+HOST='192.168.0.100'    # multi-node
+PORT='33306'            # multi-node
+#HOST='192.168.0.101'   # single-node
+#PORT='3306'            # single-node
+USER='mydb'
+PASSWORD='password'
+DB='mydb'
+TABLE='seq_num'
+ 
+MYSQLBIN=`command -v mysql`
+MYSQL_EXEC="$MYSQLBIN -u $USER -p$PASSWORD -h$HOST -P$PORT -A -Bse"
+QUERY_TRUNCATE="TRUNCATE TABLE $DB.$TABLE;"
+QUERY_INSERT="INSERT INTO $DB.$TABLE VALUES (1);"
+QUERY_SELECT="SELECT number FROM $DB.$TABLE;"
+QUERY_UPDATE="UPDATE $DB.$TABLE SET number = number + 1;"
+cat /dev/null > $OUTPUT_FILE
+ 
+$MYSQL_EXEC "$QUERY_TRUNCATE"
+$MYSQL_EXEC "$QUERY_INSERT"
+ 
+## Looping
+for (( i=1; i<=$COUNT; i++ ))
+do
+        val1=$($MYSQL_EXEC "$QUERY_SELECT")
+        $MYSQL_EXEC "$QUERY_UPDATE"
+        val2=$($MYSQL_EXEC "$QUERY_SELECT")
+        echo "#$i: $val1 -> $val2" >> $OUTPUT_FILE
+done
